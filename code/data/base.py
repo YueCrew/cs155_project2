@@ -58,15 +58,15 @@ class GeneralVideoDataset(Dataset[Any], ABC):
 
     def __init__(
         self,
-        num_frames: Int = 16,
-        resolution: Sequence[Int] = (288, 288),
+        num_frames: int = 16,
+        resolution: Sequence[int] = (288, 288),
         decode_method: DecodeMethod = "decord",
         resize_method: ResizeMethod = "center_crop_resize",
         frame_sampling_method: FrameSamplingMethod = "max_stride",
         output_range: OutputRange = "unit",
         dtype: str | torch.dtype = torch.float32,
         seed: int = 42,
-        max_num_videos: Int | None = None,
+        max_num_videos: int | None = None,
     ) -> None:
         """Initialize the GeneralVideoDataset.
 
