@@ -52,8 +52,17 @@ def load_params(
         resolved_step = int(step) if step is not None else mgr.latest_step()
         if resolved_step is None:
             raise FileNotFoundError(f"No checkpoint found under: {ckpt_dir}")
-        # Restore without an abstract template — Orbax infers the structure.
-        ckpt = mgr.restore(int(resolved_step), args=ocp.args.PyTreeRestore())
+        mesh = Mesh(jax.devices()[:1], ('data',))
+        sharding = NamedSharding(mesh, PartitionSpec())
+
+        # Force Orbax to restore using the single-device sharding
+        ckpt = mgr.restore(
+            int(resolved_step), 
+            args=ocp.args.PyTreeRestore(
+                item=None, # Orbax will still infer keys
+                sharding=sharding
+            )
+        )
     finally:
         mgr.close()
 
@@ -62,7 +71,7 @@ def load_params(
 
     # Convert all leaves to host numpy arrays.
     params = tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), ckpt["params"])
-    atlas_logger.info("Loaded params from %s (step %d)", ckpt_dir, resolved_step)
+    print("Loaded params from %s (step %d)", ckpt_dir, resolved_step)
     return params, int(resolved_step)
 
 
@@ -130,14 +139,14 @@ class CheckpointManager:
                 multiprocessing_options=mp_opts,
             )
             self._mgr = ocp.CheckpointManager(str(self._ckpt_dir), checkpointer, options=options)
-            atlas_logger.info(
+            print(
                 "Checkpoint: process-0-only save to %s (every %s steps, keep %d)",
                 self._ckpt_dir,
                 self._save_every,
                 self._max_to_keep,
             )
         elif not need_mgr:
-            atlas_logger.info("Checkpointing disabled (save_every_n_steps=None, resume=False)")
+            print("Checkpointing disabled (save_every_n_steps=None, resume=False)")
 
     # ------------------------------------------------------------------
     # Properties
@@ -190,7 +199,7 @@ class CheckpointManager:
                 if force:
                     # Block until async write completes (used for final checkpoint).
                     self._mgr.wait_until_finished()
-                atlas_logger.info("Saved checkpoint at step %d", step)
+                print("Saved checkpoint at step %d", step)
             except Exception as e:
                 atlas_logger.warning("Checkpoint save failed at step %d: %s", step, e)
 
@@ -237,7 +246,7 @@ class CheckpointManager:
         meta = multihost_utils.broadcast_one_to_all(meta)
         if int(meta[0]) == 0:
             if self._is_main:
-                atlas_logger.info("No checkpoint found for resume")
+                print("No checkpoint found for resume")
             self._sync("ckpt_restore_post")
             return None
 
@@ -258,7 +267,14 @@ class CheckpointManager:
                 "opt_state": opt_state_host,
                 "rngs": np.zeros((2,), dtype=np.uint32),
             }
-            ckpt = self._mgr.restore(restored_step, args=ocp.args.PyTreeRestore(item=abstract))
+
+            # Create restore args that explicitly use your current mesh's sharding
+            restore_args = tree_util.tree_map(
+                lambda x: ocp.args.PyTreeRestore(item=x, sharding=self._replicated_sharding),
+                abstract
+            )
+
+            ckpt = self._mgr.restore(restored_step, args=restore_args)
             params_host = jax.device_get(ckpt["params"])
             opt_state_host = jax.device_get(ckpt["opt_state"])
             rng_key = np.asarray(jax.device_get(ckpt["rngs"]), dtype=np.uint32).ravel()
@@ -287,7 +303,7 @@ class CheckpointManager:
         rngs_local = jax.random.split(rng_key, self._num_local_devices)
         rngs = host_local_to_global_array(rngs_local, self._mesh, PartitionSpec("data"))
 
-        atlas_logger.info(
+        print(
             "Restored checkpoint at step %d (process %d)",
             restored_step,
             self._process_index,
