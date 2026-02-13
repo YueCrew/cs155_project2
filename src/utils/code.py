@@ -106,9 +106,37 @@ def load_model(checkpoint_path: str | Path | None = None) -> None:
         from flax import serialization
 
         ckpt_path = Path(checkpoint_path).expanduser().resolve()
-        print(f"Loading checkpoint: {ckpt_path}")
+        size_mb = ckpt_path.stat().st_size / 1e6
+        print(f"Loading checkpoint: {ckpt_path} ({size_mb:.1f} MB)")
+
         with open(ckpt_path, "rb") as f:
-            loaded = serialization.from_bytes(_params, f.read())
+            raw = f.read()
+
+        # Try standard flax deserialization first; fall back to a streaming
+        # msgpack unpacker with raised size limits for large (>1 GB) files.
+        try:
+            loaded = serialization.from_bytes(_params, raw)
+        except (ValueError, Exception) as exc:
+            print(f"Standard from_bytes failed ({exc}), retrying with raised msgpack limits …")
+            import io
+            import msgpack
+            from flax.serialization import _msgpack_ext_unpack, from_state_dict
+
+            buf_len = len(raw) + 1024
+            unpacker = msgpack.Unpacker(
+                io.BytesIO(raw),
+                ext_hook=_msgpack_ext_unpack,
+                raw=False,
+                max_buffer_size=buf_len,
+                max_bin_len=buf_len,
+                max_str_len=buf_len,
+                max_array_len=buf_len,
+                max_map_len=buf_len,
+                max_ext_len=buf_len,
+            )
+            state_dict = next(unpacker)
+            loaded = from_state_dict(_params, state_dict)
+
         _params = jax.tree_util.tree_map(jnp.asarray, loaded)
     else:
         print("Using pretrained weights (no checkpoint)")
