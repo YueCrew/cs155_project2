@@ -168,6 +168,8 @@ def l2_normalize(x: jax.Array, eps: float = 1e-8) -> jax.Array:
 def get_video_embeddings(
     video_folder: str | Path,
     *,
+    model=None,
+    params=None,
     num_frames: int = 16,
     resolution: tuple[int, int] = (288, 288),
     seed: int = 42,
@@ -179,19 +181,20 @@ def get_video_embeddings(
     so that the ordering is consistent with :func:`get_text_embeddings` when
     both folders contain files with the same names.
 
-    Videos are decoded and embedded in small batches (default 1) to keep
-    memory usage low.
+    Videos that fail to decode (corrupt files, unsupported codecs, or videos
+    with fewer frames than ``num_frames``) are skipped with a warning.
 
     Args:
         video_folder: Path to a directory containing ``.mp4`` video files.
+        model: Pre-loaded model object.  If *None*, uses the global singleton.
+        params: Pre-loaded model params.  Must be provided together with *model*.
         num_frames: Number of frames to sample per video.
         resolution: Spatial resolution ``(H, W)`` for decoded frames.
         seed: Random seed for frame sampling.
         batch_size: Videos per forward-pass batch (default 1 to save RAM).
 
     Returns:
-        ``(embeddings, labels)`` where *embeddings* is a JAX array of shape
-        ``(N, D)`` and *labels* is a list of filename stems (without extension).
+        ``(embeddings, labels)`` — only successfully decoded videos are included.
     """
     import gc
 
@@ -199,72 +202,139 @@ def get_video_embeddings(
 
     from data.utils import decode
 
-    model, params = _get_model_and_params()
+    if model is None or params is None:
+        model, params = _get_model_and_params()
 
     video_folder = Path(video_folder)
     video_files = sorted(video_folder.glob("*.mp4"), key=lambda p: p.stem)
     if not video_files:
         raise FileNotFoundError(f"No .mp4 files found in {video_folder}")
 
-    labels = [p.stem for p in video_files]
     print(f"Found {len(video_files)} videos in {video_folder}")
 
     rng = random.Random(seed)
 
-    # Decode and embed in batches to keep memory usage low.
     emb_list: list[jax.Array] = []
+    labels: list[str] = []
     for i in range(0, len(video_files), batch_size):
         batch_files = video_files[i : i + batch_size]
         print(f"  Processing videos {i + 1}–{i + len(batch_files)} / {len(video_files)} …")
 
-        # Decode only this batch's videos
         video_tensors = []
+        batch_labels = []
         for vf in batch_files:
-            video_tensor, _meta = decode(
-                str(vf),
-                num_frames,
-                resolution,
-                decode_method="decord",
-                resize_method="center_crop_resize",
-                frame_sampling_method="max_stride",
-                output_range="unit",
-                dtype=torch.float32,
-                rng=rng,
-            )
-            video_tensors.append(video_tensor)
+            try:
+                video_tensor, _meta = decode(
+                    str(vf),
+                    num_frames,
+                    resolution,
+                    decode_method="decord",
+                    resize_method="center_crop_resize",
+                    frame_sampling_method="max_stride",
+                    output_range="unit",
+                    dtype=torch.float32,
+                    rng=rng,
+                )
+                if video_tensor.shape[0] == 0:
+                    print(f"    WARNING: {vf.name} decoded to 0 frames — skipping")
+                    continue
+                video_tensors.append(video_tensor)
+                batch_labels.append(vf.stem)
+            except Exception as exc:
+                print(f"    WARNING: failed to decode {vf.name}: {exc} — skipping")
+                continue
+
+        if not video_tensors:
+            continue
 
         batch = torch.stack(video_tensors, dim=0)
         video_input = jnp.asarray(batch.numpy())
 
-        # Free torch tensors before the forward pass
         del video_tensors, batch
         gc.collect()
 
         v_emb = model.get_adapted_video_embeddings(params, video_input, train=False)
         emb_list.append(l2_normalize(v_emb.astype(jnp.float32)))
+        labels.extend(batch_labels)
 
-        # Free the JAX input array
         del video_input, v_emb
         gc.collect()
 
+    if not emb_list:
+        raise RuntimeError(
+            f"All videos in {video_folder} failed to decode. "
+            "Check that they are valid .mp4 files with enough frames."
+        )
+
+    print(f"  Successfully embedded {len(labels)} / {len(video_files)} videos")
     return jnp.concatenate(emb_list, axis=0), labels
+
+
+def _extract_caption(data: dict, caption_key: str) -> str | None:
+    """Extract a plain-text caption from a JSON annotation dict.
+
+    Handles two formats:
+      1. Simple:  ``{"summary": "A dog catches a ball."}``
+      2. Nested:  ``{"summary": "[{\\"summary_multimodal\\": \\"...\\" }]"}``
+         where the value is a **stringified** JSON array.  In that case the
+         function parses the inner JSON and looks for ``summary_multimodal``,
+         then ``summary_video_only``, then ``summary``, then falls back to
+         the first string value it finds.
+
+    Returns *None* if no caption could be extracted.
+    """
+    raw = data.get(caption_key)
+    if raw is None:
+        return None
+
+    # If the value is already a clean string (not JSON-encoded), use it.
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        # Detect stringified JSON (starts with '[' or '{')
+        if stripped and stripped[0] in ("[", "{"):
+            try:
+                inner = json.loads(stripped)
+                # Unwrap single-element list
+                if isinstance(inner, list) and len(inner) > 0:
+                    inner = inner[0]
+                if isinstance(inner, dict):
+                    # Prefer multimodal > video_only > summary > first string
+                    for key in ("summary_multimodal", "summary_video_only", "summary"):
+                        if key in inner and isinstance(inner[key], str):
+                            return inner[key]
+                    # Fallback: grab the first string value
+                    for v in inner.values():
+                        if isinstance(v, str) and len(v) > 20:
+                            return v
+                # If inner is itself a string, use it
+                if isinstance(inner, str):
+                    return inner
+            except (json.JSONDecodeError, TypeError):
+                pass  # not valid JSON — treat as plain text
+        return raw
+
+    return None
 
 
 def get_text_embeddings(
     text_folder: str | Path,
     *,
+    model=None,
+    params=None,
     caption_key: str = "summary",
     batch_size: int = 32,
 ) -> tuple[jax.Array, list[str]]:
     """Compute L2-normalized text embeddings from ``.json`` caption files.
 
     Each JSON file should have a top-level key (default ``"summary"``) whose
-    value is the caption string.  Files are discovered as
-    ``text_folder/*.json`` and sorted by filename stem so the ordering matches
-    :func:`get_video_embeddings` when both folders share the same names.
+    value is either a plain caption string **or** a stringified JSON array
+    containing nested summary fields (``summary_multimodal``, etc.).  The
+    function auto-detects the format and extracts the best available caption.
 
     Args:
         text_folder: Path to a directory containing ``.json`` caption files.
+        model: Pre-loaded model object.  If *None*, uses the global singleton.
+        params: Pre-loaded model params.  Must be provided together with *model*.
         caption_key: The JSON key that holds the caption text.
         batch_size: Texts per forward-pass batch.
 
@@ -272,7 +342,8 @@ def get_text_embeddings(
         ``(embeddings, labels)`` where *embeddings* is a JAX array of shape
         ``(N, D)`` and *labels* is a list of filename stems (without extension).
     """
-    model, params = _get_model_and_params()
+    if model is None or params is None:
+        model, params = _get_model_and_params()
 
     text_folder = Path(text_folder)
     json_files = sorted(text_folder.glob("*.json"), key=lambda p: p.stem)
@@ -284,16 +355,20 @@ def get_text_embeddings(
     for jf in json_files:
         with open(jf) as f:
             data = json.load(f)
-        if caption_key not in data:
-            print(f"  Warning: {jf.name} has no '{caption_key}' key, skipping")
+        caption = _extract_caption(data, caption_key)
+        if caption is None:
+            print(f"  Warning: {jf.name} — could not extract caption, skipping")
             continue
         labels.append(jf.stem)
-        texts.append(data[caption_key])
+        texts.append(caption)
+        # Show a preview so the user can verify the right text was extracted
+        preview = caption[:80].replace("\n", " ")
+        print(f"  {jf.stem}: \"{preview}…\"")
 
     if not texts:
         raise ValueError(
             f"No captions found — none of the JSON files in {text_folder} "
-            f"contain the key '{caption_key}'"
+            f"contain a usable caption under key '{caption_key}'"
         )
 
     print(f"Found {len(texts)} captions in {text_folder}")
