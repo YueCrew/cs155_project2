@@ -11,7 +11,7 @@ model:
   lora_verbose: false
 
   # Shared runtime / tokenize options
-  use_bfloat16: false
+  use_bfloat16: true
   max_length: 64
   add_bos: true
 

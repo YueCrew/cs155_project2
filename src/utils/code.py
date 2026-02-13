@@ -137,7 +137,12 @@ def load_model(checkpoint_path: str | Path | None = None) -> None:
             state_dict = next(unpacker)
             loaded = from_state_dict(_params, state_dict)
 
+        # Free the raw bytes and intermediate copies to reclaim ~2–4 GB
+        del raw
         _params = jax.tree_util.tree_map(jnp.asarray, loaded)
+        del loaded
+        import gc as _gc
+        _gc.collect()
     else:
         print("Using pretrained weights (no checkpoint)")
 
