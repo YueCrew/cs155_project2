@@ -137,6 +137,7 @@ def load_model(checkpoint_path: str | Path | None = None) -> None:
             )
             state_dict = next(unpacker)
             loaded = from_state_dict(_params, state_dict)
+            del state_dict
 
         # Free the raw bytes and intermediate copies to reclaim ~2–4 GB
         del raw
@@ -146,6 +147,18 @@ def load_model(checkpoint_path: str | Path | None = None) -> None:
         _gc.collect()
     else:
         print("Using pretrained weights (no checkpoint)")
+
+    # Free the pretrained adapter weights on the model object — they are
+    # superseded by _params and no longer needed for inference.
+    _model.adapter_params = {}
+
+    # Store params in bfloat16 permanently to halve memory.  Inference
+    # quality is unaffected; results are cast back to float32 after the
+    # forward pass.
+    _params = to_bfloat16(_params)
+
+    import gc as _gc
+    _gc.collect()
 
     print(f"Model class: {type(_model).__name__}")
     print(f"Top-level param keys: {list(_params.keys())}")
@@ -271,13 +284,22 @@ def get_video_embeddings(
         if not video_tensors:
             continue
 
-        video_input = jnp.stack([from_dlpack(t.contiguous()) for t in video_tensors], axis=0)
-
+        # Convert each PyTorch tensor to JAX one-at-a-time so the
+        # PyTorch copy can be freed immediately, avoiding holding two
+        # full copies (PyTorch + JAX) of the batch in RAM at once.
+        jax_frames = []
+        for t in video_tensors:
+            jax_frames.append(from_dlpack(t.contiguous()))
         del video_tensors
         gc.collect()
 
-        v_emb = _jit_video_forward(to_bfloat16(params), video_input)
-        emb_list.append(l2_normalize(v_emb.astype(jnp.float32)))
+        video_input = jnp.stack(jax_frames, axis=0)
+        del jax_frames
+        gc.collect()
+
+        v_emb = _jit_video_forward(params, video_input)
+        # Move to numpy immediately so the JAX device buffer is freed.
+        emb_list.append(np.asarray(l2_normalize(v_emb.astype(jnp.float32))))
         labels.extend(batch_labels)
 
         del video_input, v_emb
@@ -290,7 +312,7 @@ def get_video_embeddings(
         )
 
     print(f"  Successfully embedded {len(labels)} / {len(video_files)} videos")
-    return jnp.concatenate(emb_list, axis=0), labels
+    return jnp.asarray(np.concatenate(emb_list, axis=0)), labels
 
 
 def _extract_caption(data: dict, caption_key: str) -> str | None:
@@ -404,12 +426,13 @@ def get_text_embeddings(
         print(f"  Processing texts {i + 1}–{i + len(batch_texts)} / {len(texts)} …")
         tokenized = model.tokenize(batch_texts)
         tokenized = to_bfloat16(tokenized)
-        t_emb = model.get_adapted_text_embeddings(to_bfloat16(params), tokenized, train=False)
-        emb_list.append(l2_normalize(t_emb.astype(jnp.float32)))
+        t_emb = model.get_adapted_text_embeddings(params, tokenized, train=False)
+        # Move to numpy immediately so the JAX device buffer is freed.
+        emb_list.append(np.asarray(l2_normalize(t_emb.astype(jnp.float32))))
         del tokenized, t_emb
         gc.collect()
 
-    return jnp.concatenate(emb_list, axis=0), labels
+    return jnp.asarray(np.concatenate(emb_list, axis=0)), labels
 
 
 # ---------------------------------------------------------------------------
