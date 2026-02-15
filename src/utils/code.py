@@ -352,7 +352,7 @@ def _compact_text_diff(
     return diff_lines
 
 
-def diff_video_descriptions(
+def _diff_video_descriptions_single_file(
     before_annotations_file: str | Path,
     after_annotations_file: str | Path,
     *,
@@ -363,28 +363,9 @@ def diff_video_descriptions(
     max_boundary_examples: int = 8,
     max_text_diff_examples: int = 10,
     max_text_diff_lines: int = 10,
+    print_report: bool = True,
 ) -> dict[str, Any]:
-    """Compare ``video_descriptions`` between two annotation files.
-
-    The report focuses on:
-      - segment count before vs after
-      - how time intervals changed (unchanged, added, removed, likely boundary edits)
-      - content diffs for segments whose time interval stayed the same
-
-    Args:
-        before_annotations_file: Path to the original annotation JSON.
-        after_annotations_file: Path to the updated annotation JSON.
-        segment_key: Key that stores list-like time segments.
-        text_key: Content key inside each segment (typically ``"text"``).
-        time_precision_decimals: Rounding precision used to define "same" interval.
-        boundary_iou_threshold: IoU threshold for likely boundary edit pairing.
-        max_boundary_examples: Max number of boundary-change examples printed.
-        max_text_diff_examples: Max number of same-interval content diffs printed.
-        max_text_diff_lines: Max unified-diff lines per content change.
-
-    Returns:
-        Dictionary with summary counts and detailed examples.
-    """
+    """Compare ``video_descriptions`` between two single annotation files."""
     before_path = Path(before_annotations_file).expanduser().resolve()
     after_path = Path(after_annotations_file).expanduser().resolve()
 
@@ -528,58 +509,173 @@ def diff_video_descriptions(
         "content_diff_examples": changed_content_on_same_times[:max_text_diff_examples],
     }
 
-    print("")
-    print("=== video_descriptions diff report ===")
-    print(f"Before file: {before_path}")
-    print(f"After file : {after_path}")
-    print(f"Segments   : before={len(before_segments)} | after={len(after_segments)}")
-    print(
-        "Durations  : "
-        f"before={before_total_duration:.3f}s | after={after_total_duration:.3f}s"
-    )
-    print(
-        "Time match : "
-        f"same={same_time_count}, "
-        f"boundary_edits={len(boundary_pairs)}, "
-        f"removed={len(removed_segments)}, "
-        f"added={len(added_segments)}"
-    )
-    print(f"Text edits : same-time segments with changed text={len(changed_content_on_same_times)}")
-
-    if boundary_pairs:
+    if print_report:
         print("")
-        print("Likely boundary edits (old -> new):")
-        for bseg, aseg, iou in boundary_pairs[:max_boundary_examples]:
-            print(
-                "  "
-                f"{_format_seconds_hhmmss(bseg['start_s'])}-{_format_seconds_hhmmss(bseg['end_s'])}"
-                " -> "
-                f"{_format_seconds_hhmmss(aseg['start_s'])}-{_format_seconds_hhmmss(aseg['end_s'])}"
-                f" | d_start={aseg['start_s'] - bseg['start_s']:+.3f}s"
-                f", d_end={aseg['end_s'] - bseg['end_s']:+.3f}s"
-                f", IoU={iou:.2f}"
-            )
-        if len(boundary_pairs) > max_boundary_examples:
-            print(f"  ... {len(boundary_pairs) - max_boundary_examples} more not shown")
+        print("=== video_descriptions diff report ===")
+        print(f"Before file: {before_path}")
+        print(f"After file : {after_path}")
+        print(f"Segments   : before={len(before_segments)} | after={len(after_segments)}")
+        print(
+            "Durations  : "
+            f"before={before_total_duration:.3f}s | after={after_total_duration:.3f}s"
+        )
+        print(
+            "Time match : "
+            f"same={same_time_count}, "
+            f"boundary_edits={len(boundary_pairs)}, "
+            f"removed={len(removed_segments)}, "
+            f"added={len(added_segments)}"
+        )
+        print(f"Text edits : same-time segments with changed text={len(changed_content_on_same_times)}")
 
-    if changed_content_on_same_times:
-        print("")
-        print("Text diffs for unchanged time segments:")
-        for item in changed_content_on_same_times[:max_text_diff_examples]:
-            print(
-                "  "
-                f"[{_format_seconds_hhmmss(item['start_s'])}-{_format_seconds_hhmmss(item['end_s'])}]"
-            )
-            for line in item["diff_lines"]:
-                print(f"    {line}")
-        if len(changed_content_on_same_times) > max_text_diff_examples:
-            print(
-                "  "
-                f"... {len(changed_content_on_same_times) - max_text_diff_examples} more"
-                " text diffs not shown"
-            )
+        if boundary_pairs:
+            print("")
+            print("Likely boundary edits (old -> new):")
+            for bseg, aseg, iou in boundary_pairs[:max_boundary_examples]:
+                print(
+                    "  "
+                    f"{_format_seconds_hhmmss(bseg['start_s'])}-{_format_seconds_hhmmss(bseg['end_s'])}"
+                    " -> "
+                    f"{_format_seconds_hhmmss(aseg['start_s'])}-{_format_seconds_hhmmss(aseg['end_s'])}"
+                    f" | d_start={aseg['start_s'] - bseg['start_s']:+.3f}s"
+                    f", d_end={aseg['end_s'] - bseg['end_s']:+.3f}s"
+                    f", IoU={iou:.2f}"
+                )
+            if len(boundary_pairs) > max_boundary_examples:
+                print(f"  ... {len(boundary_pairs) - max_boundary_examples} more not shown")
+
+        if changed_content_on_same_times:
+            print("")
+            print("Text diffs for unchanged time segments:")
+            for item in changed_content_on_same_times[:max_text_diff_examples]:
+                print(
+                    "  "
+                    f"[{_format_seconds_hhmmss(item['start_s'])}-{_format_seconds_hhmmss(item['end_s'])}]"
+                )
+                for line in item["diff_lines"]:
+                    print(f"    {line}")
+            if len(changed_content_on_same_times) > max_text_diff_examples:
+                print(
+                    "  "
+                    f"... {len(changed_content_on_same_times) - max_text_diff_examples} more"
+                    " text diffs not shown"
+                )
 
     return report
+
+
+def diff_video_descriptions(
+    before_annotations_folder: str | Path,
+    after_annotations_folder: str | Path,
+    *,
+    segment_key: str = "video_descriptions",
+    text_key: str = "text",
+    time_precision_decimals: int = 3,
+    boundary_iou_threshold: float = 0.30,
+    max_boundary_examples: int = 8,
+    max_text_diff_examples: int = 10,
+    max_text_diff_lines: int = 10,
+    print_per_file_report: bool = True,
+) -> dict[str, Any]:
+    """Compare ``video_descriptions`` across matching JSON files in two folders.
+
+    This function expects the two folders to contain corresponding JSON files
+    with the same filenames (e.g. ``abc.json`` in both folders). For each
+    matched file, it computes the same per-file diff report as the single-file
+    helper and then returns an aggregate summary.
+    """
+    before_dir = Path(before_annotations_folder).expanduser().resolve()
+    after_dir = Path(after_annotations_folder).expanduser().resolve()
+    if not before_dir.is_dir():
+        raise NotADirectoryError(f"before_annotations_folder is not a directory: {before_dir}")
+    if not after_dir.is_dir():
+        raise NotADirectoryError(f"after_annotations_folder is not a directory: {after_dir}")
+
+    before_files = sorted(before_dir.glob("*.json"), key=lambda p: p.name)
+    if not before_files:
+        raise FileNotFoundError(f"No .json files found in {before_dir}")
+
+    processed_files: list[str] = []
+    missing_in_after: list[str] = []
+    per_file_reports: dict[str, dict[str, Any]] = {}
+
+    totals = {
+        "num_segments_before": 0,
+        "num_segments_after": 0,
+        "same_time_count": 0,
+        "removed_time_count": 0,
+        "added_time_count": 0,
+        "likely_boundary_edit_count": 0,
+        "changed_text_same_time_count": 0,
+        "before_total_duration_s": 0.0,
+        "after_total_duration_s": 0.0,
+    }
+
+    for before_file in before_files:
+        after_file = after_dir / before_file.name
+        if not after_file.exists():
+            missing_in_after.append(before_file.name)
+            continue
+
+        file_report = _diff_video_descriptions_single_file(
+            before_file,
+            after_file,
+            segment_key=segment_key,
+            text_key=text_key,
+            time_precision_decimals=time_precision_decimals,
+            boundary_iou_threshold=boundary_iou_threshold,
+            max_boundary_examples=max_boundary_examples,
+            max_text_diff_examples=max_text_diff_examples,
+            max_text_diff_lines=max_text_diff_lines,
+            print_report=print_per_file_report,
+        )
+        per_file_reports[before_file.name] = file_report
+        processed_files.append(before_file.name)
+
+        for key in totals:
+            totals[key] += file_report[key]
+
+    print("")
+    print("=== aggregate video_descriptions diff report ===")
+    print(f"Before folder: {before_dir}")
+    print(f"After folder : {after_dir}")
+    print(f"Files        : processed={len(processed_files)} | missing_in_after={len(missing_in_after)}")
+    print(
+        "Segments     : "
+        f"before={totals['num_segments_before']} | after={totals['num_segments_after']}"
+    )
+    print(
+        "Durations    : "
+        f"before={totals['before_total_duration_s']:.3f}s | "
+        f"after={totals['after_total_duration_s']:.3f}s"
+    )
+    print(
+        "Time match   : "
+        f"same={totals['same_time_count']}, "
+        f"boundary_edits={totals['likely_boundary_edit_count']}, "
+        f"removed={totals['removed_time_count']}, "
+        f"added={totals['added_time_count']}"
+    )
+    print(
+        "Text edits   : "
+        f"same-time segments with changed text={totals['changed_text_same_time_count']}"
+    )
+    if missing_in_after:
+        print("Missing files in after folder:")
+        for name in missing_in_after:
+            print(f"  - {name}")
+
+    return {
+        "before_folder": str(before_dir),
+        "after_folder": str(after_dir),
+        "segment_key": segment_key,
+        "files_processed_count": len(processed_files),
+        "files_missing_in_after_count": len(missing_in_after),
+        "processed_files": processed_files,
+        "missing_in_after": missing_in_after,
+        "totals": totals,
+        "per_file_reports": per_file_reports,
+    }
 
 
 # ---------------------------------------------------------------------------
