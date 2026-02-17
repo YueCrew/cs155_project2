@@ -492,13 +492,6 @@ class HTMLVideoAnnotationVisualizer:
                 local_url = f"http://localhost:{port}/video_annotation_visualizer.html"
                 network_url = f"http://{ip_address}:{port}/video_annotation_visualizer.html"
 
-                print("🚀 Server started!")
-                print(f"   - To access on this machine: {local_url}")
-                print(f"   - To share on your network: {network_url}")
-                print("📄 HTML file generated: video_annotation_visualizer.html")
-                print(f"🎬 Serving videos from: {self.video_dir}")
-                print(f"💾 Saving annotations to: {self.output_dir}")
-
                 try:
                     webbrowser.open(local_url)
                 except Exception:
