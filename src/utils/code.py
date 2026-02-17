@@ -352,6 +352,46 @@ def _compact_text_diff(
     return diff_lines
 
 
+def _exact_text_edits(
+    before_text: str,
+    after_text: str,
+    max_lines: int = 10,
+) -> list[str]:
+    """Show only changed text chunks (no surrounding context)."""
+
+    def _truncate_chunk(text: str, max_chars: int = 160) -> str:
+        safe = text.replace("\n", "\\n")
+        if len(safe) <= max_chars:
+            return safe
+        return safe[: max_chars - 3] + "..."
+
+    before_tokens = re.findall(r"\s+|[^\s]+", before_text)
+    after_tokens = re.findall(r"\s+|[^\s]+", after_text)
+    matcher = difflib.SequenceMatcher(a=before_tokens, b=after_tokens)
+
+    out: list[str] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        before_chunk = "".join(before_tokens[i1:i2])
+        after_chunk = "".join(after_tokens[j1:j2])
+        if tag == "replace":
+            out.append(
+                f"replace: '{_truncate_chunk(before_chunk)}' -> '{_truncate_chunk(after_chunk)}'"
+            )
+        elif tag == "delete":
+            out.append(f"delete : '{_truncate_chunk(before_chunk)}'")
+        elif tag == "insert":
+            out.append(f"insert : '{_truncate_chunk(after_chunk)}'")
+
+    if not out:
+        return ["(text changed, but no token-level edit extracted)"]
+    if len(out) > max_lines:
+        hidden = len(out) - max_lines
+        return out[:max_lines] + [f"... ({hidden} more edits hidden)"]
+    return out
+
+
 def _preview_text(text: str, max_chars: int = 220) -> str:
     """Return a one-line preview for readable log output."""
     compact = " ".join(text.split())
@@ -475,7 +515,7 @@ def _diff_video_descriptions_single_file(
                     "end_s": bseg["end_s"],
                     "before_text": bseg["text"],
                     "after_text": aseg["text"],
-                    "diff_lines": _compact_text_diff(
+                    "diff_lines": _exact_text_edits(
                         bseg["text"],
                         aseg["text"],
                         max_lines=max_text_diff_lines,
