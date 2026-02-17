@@ -1090,18 +1090,6 @@ def get_video_embeddings(
             "Check that they are valid .mp4 files with enough frames."
         )
 
-    print(f"  Successfully embedded {len(labels)} / {len(video_files)} clips")
-    print(
-        f"  Decode results: tasks={len(decode_tasks)} | ok={len(decode_results)} | "
-        f"failed={decode_failures} | zero_frames={decode_zero}"
-    )
-    if interval_attempted > 0:
-        print(
-            "  Interval decode totals: "
-            f"attempted={interval_attempted}, successful={interval_ok}, "
-            f"failed={interval_attempted - interval_ok}"
-        )
-
     embeddings = jnp.asarray(np.concatenate(emb_list, axis=0))
 
     if npz_filepath is not None:
