@@ -794,6 +794,9 @@ def get_video_embeddings(
     resolution: tuple[int, int] = (288, 288),
     seed: int = 42,
     batch_size: int = 1,
+    num_decode_workers: int = 1,
+    max_total_duration_s: float | None = None,
+    show_tqdm: bool = True,
 ) -> tuple[jax.Array, list[str]]:
     """Compute L2-normalized video embeddings for every ``.mp4`` in a folder.
 
@@ -818,7 +821,14 @@ def get_video_embeddings(
         min_interval_segments: Minimum number of valid intervals required to use
             interval decoding; otherwise full-video fallback is used.
         segment_progress_every: Print interval progress every N decoded segment
-            attempts (in addition to first/last segment per video).
+            attempts (in addition to first/last segment per video). Uses no
+            effect when tqdm is enabled.
+        num_decode_workers: Number of threads used for decoding. Set to 1 for
+            fully sequential behavior.
+        max_total_duration_s: Optional cap in seconds for total interval content
+            to decode before moving to fallback/full-video decoding.
+        show_tqdm: Show tqdm bars for decoding and embedding loops when
+            tqdm is available.
         model: Pre-loaded model object.  If *None*, uses the global singleton.
         params: Pre-loaded model params.  Must be provided together with *model*.
         num_frames: Number of frames to sample per video.
@@ -830,10 +840,17 @@ def get_video_embeddings(
         ``(embeddings, labels)`` — only successfully decoded videos are included.
     """
     import gc
+    import random
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     import torch
 
     from data.utils import decode
+
+    try:
+        from tqdm.auto import tqdm
+    except Exception:
+        tqdm = None
 
     if model is None or params is None:
         model, params = _get_model_and_params()
@@ -847,7 +864,10 @@ def get_video_embeddings(
     print(f"Found {len(video_files)} videos in {video_folder}")
     print(f"Using annotations from: {annotation_folder}")
 
-    rng = random.Random(seed)
+    if num_decode_workers < 1:
+        num_decode_workers = 1
+    if segment_progress_every < 1:
+        segment_progress_every = 1
 
     @jax.jit
     def _jit_video_forward(params, video_input):
@@ -858,10 +878,11 @@ def get_video_embeddings(
         pending_labels: list[str],
         emb_list: list[jax.Array],
         labels: list[str],
-    ) -> None:
+    ) -> int:
         """Run one forward pass on pending tensors and append outputs."""
         if not pending_tensors:
-            return
+            return 0
+        flushed = len(pending_tensors)
         jax_frames = [from_dlpack(t.contiguous()) for t in pending_tensors]
         del pending_tensors[:]
         gc.collect()
@@ -878,103 +899,32 @@ def get_video_embeddings(
         del video_input, v_emb
         gc.collect()
 
-    # Build a quick plan first so progress can include total segment count.
-    decode_plan: list[tuple[Path, list[tuple[float, float]], bool]] = []
-    total_interval_segments = 0
-    for vf in video_files:
-        ann_path = annotation_folder / f"{vf.stem}.json"
-        intervals: list[tuple[float, float]] = []
-        if ann_path.exists():
-            try:
-                with open(ann_path) as f:
-                    ann_data = json.load(f)
-                intervals = _extract_annotation_intervals(ann_data, segment_key=segment_key)
-            except Exception:
-                intervals = []
-        use_intervals = len(intervals) >= min_interval_segments
-        if use_intervals:
-            total_interval_segments += len(intervals)
-        decode_plan.append((vf, intervals, use_intervals))
+        return flushed
 
-    print(
-        f"Planned interval decoding: {total_interval_segments} segments "
-        f"(fallback videos: {sum(1 for _vf, _itv, use_itv in decode_plan if not use_itv)})"
-    )
-    if segment_progress_every < 1:
-        segment_progress_every = 1
+    def _progress_iter(iterable, total=None, desc="", unit="item"):
+        if show_tqdm and tqdm is not None:
+            return tqdm(iterable, total=total, desc=desc, unit=unit)
+        return iterable
 
-    emb_list: list[jax.Array] = []
-    labels: list[str] = []
-    pending_tensors: list[torch.Tensor] = []
-    pending_labels: list[str] = []
-    global_segment_done = 0
-    global_segment_ok = 0
-
-    for idx, (vf, intervals, use_intervals) in enumerate(decode_plan, start=1):
-        print(f"  Processing video {idx} / {len(video_files)}: {vf.name} …")
-        ann_path = annotation_folder / f"{vf.stem}.json"
-        if not ann_path.exists():
-            print(f"    NOTE: no annotation for {vf.name} at {ann_path.name} — full-video fallback")
-        elif not use_intervals and len(intervals) == 0:
-            # Distinguish parse failure / missing key from explicit short list.
-            try:
-                with open(ann_path) as f:
-                    ann_data = json.load(f)
-                if segment_key not in ann_data:
-                    print(f"    NOTE: key '{segment_key}' not found in {ann_path.name} — full-video fallback")
-            except Exception as exc:
-                print(f"    WARNING: failed to parse {ann_path.name}: {exc} — full-video fallback")
-
-        if use_intervals:
-            print(f"    Using {len(intervals)} interval segments from '{segment_key}'")
-            for seg_idx, (start_s, end_s) in enumerate(intervals):
-                global_segment_done += 1
-                if (
-                    seg_idx == 0
-                    or seg_idx + 1 == len(intervals)
-                    or global_segment_done % segment_progress_every == 0
-                ):
-                    print(
-                        "    Segment progress: "
-                        f"video {seg_idx + 1}/{len(intervals)} | "
-                        f"global {global_segment_done}/{total_interval_segments} "
-                        f"(ok={global_segment_ok})"
-                    )
-                try:
-                    video_tensor, _meta = decode(
-                        str(vf),
-                        num_frames,
-                        resolution,
-                        decode_method="pyav",
-                        resize_method="center_crop_resize",
-                        frame_sampling_method="interval",
-                        output_range="unit",
-                        dtype=torch.bfloat16,
-                        rng=rng,
-                        interval=(start_s, end_s),
-                    )
-                    if video_tensor.shape[0] == 0:
-                        print(
-                            f"    WARNING: {vf.name} segment {seg_idx} [{start_s:.3f}, {end_s:.3f}] "
-                            "decoded to 0 frames — skipping"
-                        )
-                        continue
-                    pending_tensors.append(video_tensor)
-                    pending_labels.append(f"{vf.stem}#seg{seg_idx:03d}")
-                    global_segment_ok += 1
-                except Exception as exc:
-                    print(f"    WARNING: failed interval decode for {vf.name} seg {seg_idx}: {exc} — skipping")
-                    continue
-
-                if len(pending_tensors) >= batch_size:
-                    _flush_batch(pending_tensors, pending_labels, emb_list, labels)
-        else:
-            if ann_path.exists():
-                print(
-                    f"    NOTE: only {len(intervals)} valid segments (< {min_interval_segments}); "
-                    "using full-video fallback"
+    def _decode_worker(task):
+        task_idx, vf, label, is_interval, interval = task
+        start_s, end_s = interval if interval else (None, None)
+        try:
+            if is_interval:
+                local_rng = random.Random(seed + task_idx)
+                video_tensor, _meta = decode(
+                    str(vf),
+                    num_frames,
+                    resolution,
+                    decode_method="pyav",
+                    resize_method="center_crop_resize",
+                    frame_sampling_method="interval",
+                    output_range="unit",
+                    dtype=torch.bfloat16,
+                    rng=local_rng,
+                    interval=(start_s, end_s),
                 )
-            try:
+            else:
                 video_tensor, _meta = decode(
                     str(vf),
                     num_frames,
@@ -984,19 +934,153 @@ def get_video_embeddings(
                     frame_sampling_method="max_stride",
                     output_range="unit",
                     dtype=torch.bfloat16,
-                    rng=rng,
                 )
-                if video_tensor.shape[0] == 0:
-                    print(f"    WARNING: {vf.name} decoded to 0 frames — skipping")
-                    continue
-                pending_tensors.append(video_tensor)
-                pending_labels.append(vf.stem)
-            except Exception as exc:
-                print(f"    WARNING: failed to decode {vf.name}: {exc} — skipping")
-                continue
 
-            if len(pending_tensors) >= batch_size:
-                _flush_batch(pending_tensors, pending_labels, emb_list, labels)
+            if video_tensor.shape[0] == 0:
+                return task_idx, label, is_interval, None, "zero_frames"
+
+            return task_idx, label, is_interval, video_tensor, None
+        except Exception as exc:
+            return task_idx, label, is_interval, None, str(exc)
+
+    def _log(msg: str):
+        if not (show_tqdm and tqdm is not None):
+            print(msg)
+
+    decode_tasks: list[tuple[int, Path, str, bool, tuple[float, float] | None]] = []
+    task_is_interval: dict[int, bool] = {}
+    total_interval_segments = 0
+    total_fallback_videos = 0
+    budget_remaining = float(max_total_duration_s) if max_total_duration_s is not None else None
+
+    for vf in video_files:
+        ann_path = annotation_folder / f"{vf.stem}.json"
+        intervals: list[tuple[float, float]] = []
+
+        if ann_path.exists():
+            try:
+                with open(ann_path) as f:
+                    ann_data = json.load(f)
+                intervals = _extract_annotation_intervals(ann_data, segment_key=segment_key)
+            except Exception:
+                intervals = []
+                _log(f"  NOTE: failed to parse {ann_path.name}; full-video fallback")
+        else:
+            _log(f"  Processing video: {vf.name} (no annotation; full-video fallback)")
+
+        use_intervals = len(intervals) >= min_interval_segments
+        if use_intervals and budget_remaining is not None:
+            limited_intervals: list[tuple[float, float]] = []
+            for start_s, end_s in intervals:
+                seg_dur = max(0.0, float(end_s) - float(start_s))
+                if budget_remaining <= 0.0:
+                    break
+                if seg_dur > budget_remaining and not limited_intervals:
+                    break
+                if seg_dur > budget_remaining:
+                    break
+                limited_intervals.append((float(start_s), float(end_s)))
+                budget_remaining -= seg_dur
+                if budget_remaining <= 0.0:
+                    break
+            if len(limited_intervals) != len(intervals):
+                _log(f"  NOTE: max_total_duration_s reached for {vf.name}; intervals truncated")
+            intervals = limited_intervals
+            use_intervals = len(intervals) >= min_interval_segments
+
+        if use_intervals:
+            if ann_path.exists():
+                _log(f"  Using {len(intervals)} interval segments from '{segment_key}' for {vf.name}")
+            for seg_idx, (start_s, end_s) in enumerate(intervals):
+                task_idx = len(decode_tasks)
+                decode_tasks.append((task_idx, vf, f"{vf.stem}#seg{seg_idx:03d}", True, (start_s, end_s)))
+                task_is_interval[task_idx] = True
+            total_interval_segments += len(intervals)
+        else:
+            if ann_path.exists() and len(intervals) == 0:
+                _log(
+                    f"  NOTE: no usable interval segments for {vf.name}; using full-video fallback"
+                )
+            if ann_path.exists() and 0 < len(intervals) < min_interval_segments:
+                _log(
+                    f"  NOTE: only {len(intervals)} valid segments (< {min_interval_segments}) for {vf.name}; "
+                    "full-video fallback"
+                )
+
+            task_idx = len(decode_tasks)
+            decode_tasks.append((task_idx, vf, vf.stem, False, None))
+            task_is_interval[task_idx] = False
+            total_fallback_videos += 1
+
+    print(
+        f"Planned interval decoding: {total_interval_segments} segments "
+        f"(fallback videos: {total_fallback_videos})"
+    )
+    if budget_remaining is not None:
+        used_budget = (float(max_total_duration_s) - budget_remaining)
+        if used_budget < 0.0:
+            used_budget = 0.0
+        print(f"Interval duration budget used: {used_budget:.3f}s")
+
+    decode_results: list[tuple[int, str, bool, torch.Tensor | None]] = []
+    decode_failures = 0
+    decode_zero = 0
+
+    if len(decode_tasks) > 1 and num_decode_workers > 1:
+        decode_workers = min(num_decode_workers, len(decode_tasks))
+        with ThreadPoolExecutor(max_workers=decode_workers) as executor:
+            futures = {executor.submit(_decode_worker, task) for task in decode_tasks}
+            for fut in _progress_iter(as_completed(futures), total=len(futures), desc="Decoding clips", unit="clip"):
+                task_idx, label, is_interval, tensor, err = fut.result()
+                if tensor is None:
+                    if err == "zero_frames":
+                        decode_zero += 1
+                    else:
+                        decode_failures += 1
+                        _log(f"  WARNING: failed decode for {label}: {err}")
+                    continue
+                decode_results.append((task_idx, label, is_interval, tensor))
+    else:
+        for task in _progress_iter(decode_tasks, total=len(decode_tasks), desc="Decoding clips", unit="clip"):
+            task_idx, label, is_interval, tensor, err = _decode_worker(task)
+            if tensor is None:
+                if err == "zero_frames":
+                    decode_zero += 1
+                else:
+                    decode_failures += 1
+                    _log(f"  WARNING: failed decode for {label}: {err}")
+                continue
+            decode_results.append((task_idx, label, is_interval, tensor))
+
+    if not decode_results:
+        raise RuntimeError(
+            f"All videos in {video_folder} failed to decode. "
+            "Check that they are valid .mp4 files with enough frames."
+        )
+
+    decode_results.sort(key=lambda x: x[0])
+
+    emb_list: list[jax.Array] = []
+    labels: list[str] = []
+    pending_tensors: list[torch.Tensor] = []
+    pending_labels: list[str] = []
+
+    interval_attempted = sum(1 for is_interval in task_is_interval.values() if is_interval)
+    interval_ok = 0
+
+    inference_tasks = _progress_iter(
+        decode_results,
+        total=len(decode_results),
+        desc="Embedding clips",
+        unit="clip",
+    )
+    for _, label, is_interval, tensor in inference_tasks:
+        pending_tensors.append(tensor)
+        pending_labels.append(label)
+        if is_interval:
+            interval_ok += 1
+        if len(pending_tensors) >= batch_size:
+            _flush_batch(pending_tensors, pending_labels, emb_list, labels)
 
     _flush_batch(pending_tensors, pending_labels, emb_list, labels)
 
@@ -1006,12 +1090,16 @@ def get_video_embeddings(
             "Check that they are valid .mp4 files with enough frames."
         )
 
-    print(f"  Successfully embedded {len(labels)} / {len(video_files)} videos")
-    if total_interval_segments > 0:
+    print(f"  Successfully embedded {len(labels)} / {len(video_files)} clips")
+    print(
+        f"  Decode results: tasks={len(decode_tasks)} | ok={len(decode_results)} | "
+        f"failed={decode_failures} | zero_frames={decode_zero}"
+    )
+    if interval_attempted > 0:
         print(
             "  Interval decode totals: "
-            f"attempted={global_segment_done}, successful={global_segment_ok}, "
-            f"failed={global_segment_done - global_segment_ok}"
+            f"attempted={interval_attempted}, successful={interval_ok}, "
+            f"failed={interval_attempted - interval_ok}"
         )
 
     embeddings = jnp.asarray(np.concatenate(emb_list, axis=0))
@@ -1088,6 +1176,8 @@ def get_text_embeddings(
     min_interval_segments: int = 2,
     fallback_caption_key: str = "summary_multimodal",
     batch_size: int = 32,
+    num_text_workers: int = 1,
+    show_tqdm: bool = True,
 ) -> tuple[jax.Array, list[str]]:
     """Compute L2-normalized text embeddings from ``.json`` caption files.
 
@@ -1111,11 +1201,26 @@ def get_text_embeddings(
         fallback_caption_key: Caption key to use for fallback when segment-level
             extraction is unavailable or too short.
         batch_size: Texts per forward-pass batch.
+        num_text_workers: Number of threads used for JSON parsing and caption
+            extraction.
+        show_tqdm: Show tqdm bars for parsing and embedding.
 
     Returns:
         ``(embeddings, labels)`` where *embeddings* is a JAX array of shape
         ``(N, D)`` and *labels* is a list of filename stems (without extension).
     """
+    if num_text_workers < 1:
+        num_text_workers = 1
+
+    import gc
+    import math
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    try:
+        from tqdm.auto import tqdm
+    except Exception:
+        tqdm = None
+
     if model is None or params is None:
         model, params = _get_model_and_params()
 
@@ -1124,11 +1229,26 @@ def get_text_embeddings(
     if not json_files:
         raise FileNotFoundError(f"No .json files found in {text_folder}")
 
-    labels: list[str] = []
-    texts: list[str] = []
-    for jf in json_files:
-        with open(jf) as f:
-            data = json.load(f)
+    def _progress_iter(iterable, total=None, desc="", unit="item"):
+        if show_tqdm and tqdm is not None:
+            return tqdm(iterable, total=total, desc=desc, unit=unit)
+        return iterable
+
+    def _emit(msg: str):
+        if show_tqdm and tqdm is not None:
+            tqdm.write(msg)
+        else:
+            print(msg)
+
+    def _extract_text_job(task):
+        task_idx, jf = task
+        try:
+            with open(jf) as f:
+                data = json.load(f)
+        except Exception as exc:
+            return task_idx, [], [], [f"  Warning: failed to parse {jf.name}: {exc}"], True
+
+        logs: list[str] = []
         if segment_level:
             segment_items = _extract_annotation_segment_texts(
                 data,
@@ -1136,16 +1256,18 @@ def get_text_embeddings(
                 segment_text_key=segment_text_key,
             )
             if len(segment_items) >= min_interval_segments:
-                print(
+                logs.append(
                     f"  {jf.stem}: using {len(segment_items)} segment texts "
                     f"from '{segment_key}.{segment_text_key}'"
                 )
+                labels_out: list[str] = []
+                texts_out: list[str] = []
                 for seg_idx, (_start_s, _end_s, seg_text) in enumerate(segment_items):
-                    labels.append(f"{jf.stem}#seg{seg_idx:03d}")
-                    texts.append(seg_text)
-                continue
+                    labels_out.append(f"{jf.stem}#seg{seg_idx:03d}")
+                    texts_out.append(seg_text)
+                return task_idx, labels_out, texts_out, logs, False
 
-            print(
+            logs.append(
                 f"  {jf.stem}: only {len(segment_items)} valid segments "
                 f"(< {min_interval_segments}) — using fallback caption"
             )
@@ -1154,12 +1276,49 @@ def get_text_embeddings(
         if caption is None:
             caption = _extract_caption(data, caption_key)
         if caption is None:
-            print(f"  Warning: {jf.name} — could not extract caption, skipping")
-            continue
-        labels.append(jf.stem)
-        texts.append(caption)
-        preview = caption[:80].replace("\n", " ")
-        print(f"  {jf.stem}: \"{preview}…\"")
+            logs.append(f"  Warning: {jf.name} — could not extract caption, skipping")
+            return task_idx, [], [], logs, True
+
+        logs.append(f"  {jf.stem}: \"{caption[:80].replace('\\n', ' ')}…\"")
+        return task_idx, [jf.stem], [caption], logs, False
+
+    extraction_jobs: list[tuple[int, Path]] = [(idx, jf) for idx, jf in enumerate(json_files)]
+    extraction_results: list[tuple[int, list[str], list[str], list[str], bool]] = []
+    parse_skips = 0
+
+    if len(extraction_jobs) > 1 and num_text_workers > 1:
+        with ThreadPoolExecutor(max_workers=min(num_text_workers, len(extraction_jobs))) as executor:
+            futures = [executor.submit(_extract_text_job, task) for task in extraction_jobs]
+            for fut in _progress_iter(
+                as_completed(futures),
+                total=len(futures),
+                desc="Parsing text files",
+                unit="file",
+            ):
+                task_idx, labels_out, texts_out, logs, is_skip = fut.result()
+                if is_skip:
+                    parse_skips += 1
+                extraction_results.append((task_idx, labels_out, texts_out, logs, is_skip))
+    else:
+        for task in _progress_iter(
+            extraction_jobs,
+            total=len(extraction_jobs),
+            desc="Parsing text files",
+            unit="file",
+        ):
+            task_idx, labels_out, texts_out, logs, is_skip = _extract_text_job(task)
+            if is_skip:
+                parse_skips += 1
+            extraction_results.append((task_idx, labels_out, texts_out, logs, is_skip))
+
+    extraction_results.sort(key=lambda x: x[0])
+    labels: list[str] = []
+    texts: list[str] = []
+    for _task_idx, labels_out, texts_out, logs, is_skip in extraction_results:
+        for msg in logs:
+            _emit(msg)
+        labels.extend(labels_out)
+        texts.extend(texts_out)
 
     if not texts:
         raise ValueError(
@@ -1168,13 +1327,18 @@ def get_text_embeddings(
         )
 
     print(f"Found {len(texts)} captions in {text_folder}")
-
-    import gc
+    if parse_skips > 0:
+        print(f"Skipped {parse_skips} files during text extraction")
 
     emb_list: list[jax.Array] = []
-    for i in range(0, len(texts), batch_size):
+    batch_total = math.ceil(len(texts) / batch_size)
+    for i in _progress_iter(
+        range(0, len(texts), batch_size),
+        total=batch_total,
+        desc="Embedding text",
+        unit="batch",
+    ):
         batch_texts = texts[i : i + batch_size]
-        print(f"  Processing texts {i + 1}–{i + len(batch_texts)} / {len(texts)} …")
         tokenized = model.tokenize(batch_texts)
         tokenized = to_bfloat16(tokenized)
         t_emb = model.get_adapted_text_embeddings(params, tokenized, train=False)
@@ -1207,6 +1371,8 @@ def plot_similarity_matrix(
     text_embeddings,
     *,
     labels: list[str] | None = None,
+    align_by_labels: bool = True,
+    draw_filename_boundaries: bool = True,
     show: bool = True,
 ):
     """Plot the cosine-similarity matrix between text and video embeddings.
@@ -1219,6 +1385,8 @@ def plot_similarity_matrix(
         video_embeddings: Array ``(N, D)`` or ``(array, labels)`` tuple.
         text_embeddings: Array ``(M, D)`` or ``(array, labels)`` tuple.
         labels: Optional tick labels.  Auto-detected from tuples if not given.
+        align_by_labels: If *True* and both text/video labels are available,
+            align rows/columns by exact shared labels before plotting.
         show: If *True* (default), display the plot immediately.
 
     Returns:
@@ -1227,22 +1395,48 @@ def plot_similarity_matrix(
     import matplotlib.pyplot as plt
 
     # Unpack (embeddings, labels) tuples from get_video/text_embeddings
+    _vid_labels: list[str] | None = None
+    _txt_labels: list[str] | None = None
     if isinstance(video_embeddings, (tuple, list)) and len(video_embeddings) == 2:
         video_embeddings, _vid_labels = video_embeddings
-        if labels is None:
-            labels = _vid_labels
     if isinstance(text_embeddings, (tuple, list)) and len(text_embeddings) == 2:
         text_embeddings, _txt_labels = text_embeddings
-        if labels is None:
+    if labels is None:
+        if _vid_labels is not None:
+            labels = _vid_labels
+        elif _txt_labels is not None:
             labels = _txt_labels
 
     video_np = np.asarray(video_embeddings)
     text_np = np.asarray(text_embeddings)
+    if (
+        align_by_labels
+        and _vid_labels is not None
+        and _txt_labels is not None
+        and (_vid_labels != _txt_labels)
+    ):
+        try:
+            video_np, text_np, aligned_labels = align_embeddings_by_labels(
+                video_np, _vid_labels, text_np, _txt_labels
+            )
+            _vid_labels = aligned_labels
+            _txt_labels = aligned_labels
+        except ValueError as exc:
+            # keep original order when there is nothing to align
+            print(f"Label alignment skipped: {exc}")
+
     sim_matrix = text_np @ video_np.T
     n_text, n_video = sim_matrix.shape
 
-    if labels is None:
-        labels = [f"sample_{i}" for i in range(max(n_text, n_video))]
+    if _vid_labels is None:
+        _vid_labels = labels[:n_video] if labels is not None and len(labels) >= n_video else None
+    if _txt_labels is None:
+        _txt_labels = labels[:n_text] if labels is not None and len(labels) >= n_text else None
+
+    if _vid_labels is None:
+        _vid_labels = [f"sample_{i}" for i in range(n_video)]
+    if _txt_labels is None:
+        _txt_labels = [f"sample_{i}" for i in range(n_text)]
 
     fig, ax = plt.subplots(
         figsize=(max(5, n_video * 0.8), max(4, n_text * 0.7))
@@ -1250,11 +1444,38 @@ def plot_similarity_matrix(
     im = ax.imshow(sim_matrix, cmap="viridis", aspect="auto")
     ax.set_xticks(range(n_video))
     ax.set_yticks(range(n_text))
-    ax.set_xticklabels(labels[:n_video], rotation=45, ha="right", fontsize=8)
-    ax.set_yticklabels(labels[:n_text], fontsize=8)
+    ax.set_xticklabels(_vid_labels[:n_video], rotation=45, ha="right", fontsize=8)
+    ax.set_yticklabels(_txt_labels[:n_text], fontsize=8)
     ax.set_xlabel("Video")
     ax.set_ylabel("Text")
     ax.set_title("Text\u2013Video Cosine Similarity")
+
+    if draw_filename_boundaries:
+        def _base_name(lbl: str) -> str:
+            if not isinstance(lbl, str):
+                return str(lbl)
+            if "#seg" in lbl:
+                return lbl.split("#seg", 1)[0]
+            return lbl.rsplit("#", 1)[0] if "#" in lbl else lbl
+
+        for idx in range(1, n_video):
+            if _base_name(_vid_labels[idx]) != _base_name(_vid_labels[idx - 1]):
+                ax.axvline(
+                    x=idx - 0.5,
+                    color="black",
+                    linewidth=2.6,
+                    alpha=1.0,
+                    zorder=5,
+                )
+        for idx in range(1, n_text):
+            if _base_name(_txt_labels[idx]) != _base_name(_txt_labels[idx - 1]):
+                ax.axhline(
+                    y=idx - 0.5,
+                    color="black",
+                    linewidth=2.6,
+                    alpha=1.0,
+                    zorder=5,
+                )
 
     # Annotate cells
     for i in range(n_text):
@@ -1278,6 +1499,129 @@ def plot_similarity_matrix(
     print(f"Diagonal mean:     {diag_mean:.4f}")
     print(f"Off-diagonal mean: {off_diag_mean:.4f}")
     print(f"Gap:               {diag_mean - off_diag_mean:.4f}")
+
+    return None if show else fig
+
+
+def plot_similarity_matrix_two_random_videos(
+    video_data,
+    *,
+    labels: list[str] | None = None,
+    seed: int = 42,
+    show: bool = True,
+    annotate: bool = True,
+    figsize: tuple[float, float] | None = None,
+    sort_by_segment: bool = True,
+):
+    """Plot cosine similarity between embeddings from two random videos.
+
+    Args:
+        video_data: Video embeddings array ``(N, D)`` or ``(embeddings, labels)``
+            tuple returned by :func:`get_video_embeddings`.
+        labels: Optional labels. If omitted and ``video_data`` is a tuple, labels
+            are inferred automatically.
+        seed: Seed for random video selection.
+        show: If ``True`` (default), display the plot immediately.
+        annotate: If ``True``, annotate each cell with its similarity value.
+        figsize: Optional figure size. Defaults to ``(max(6, m*0.8), max(5, n*0.7))``.
+        sort_by_segment: Sort each selected video's segments by the trailing
+            ``#segNNN`` index when present.
+
+    Returns:
+        ``matplotlib.figure.Figure`` when ``show=False``, otherwise ``None``.
+    """
+    import matplotlib.pyplot as plt
+
+    _vid_labels: list[str] | None = None
+    if isinstance(video_data, (tuple, list)) and len(video_data) == 2:
+        video_data, _vid_labels = video_data
+
+    if labels is None:
+        if _vid_labels is not None:
+            labels = _vid_labels
+        else:
+            labels = [f"sample_{i}" for i in range(len(video_data))]
+
+    video_np = np.asarray(video_data)
+    if video_np.ndim != 2:
+        raise ValueError("video_data must be a 2D array of shape (N, D)")
+    if len(labels) != video_np.shape[0]:
+        raise ValueError("labels length must match number of embeddings")
+
+    def _base_id(label: str) -> str:
+        if "#seg" in label:
+            return str(label).split("#seg", 1)[0]
+        return str(label).rsplit("#", 1)[0]
+
+    def _segment_index(label: str) -> tuple[int, int | str]:
+        m = re.search(r"#seg(\d+)$", str(label))
+        if m is None:
+            return (1_000_000, str(label))
+        return (0, int(m.group(1)))
+
+    groups: dict[str, list[int]] = {}
+    for i, lab in enumerate(labels):
+        groups.setdefault(_base_id(lab), []).append(i)
+
+    video_ids = sorted(groups.keys())
+    if len(video_ids) < 2:
+        raise ValueError("Need at least two distinct videos in labels to make a pair")
+
+    rng = np.random.default_rng(seed)
+    chosen = sorted(rng.choice(video_ids, size=2, replace=False))
+    if len(chosen) != 2:
+        raise RuntimeError("Random sampling did not return two videos")
+
+    vid_a, vid_b = chosen
+    idx_a = groups[vid_a]
+    idx_b = groups[vid_b]
+    if sort_by_segment:
+        idx_a = sorted(idx_a, key=lambda i: _segment_index(labels[i]))
+        idx_b = sorted(idx_b, key=lambda i: _segment_index(labels[i]))
+
+    a_np = video_np[idx_a]
+    b_np = video_np[idx_b]
+    sim_matrix = a_np @ b_np.T
+    n_rows, n_cols = sim_matrix.shape
+
+    if figsize is None:
+        figsize = (max(6, n_cols * 0.8), max(5, n_rows * 0.7))
+
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(sim_matrix, cmap="viridis", aspect="auto")
+    ax.set_xticks(range(n_cols))
+    ax.set_yticks(range(n_rows))
+    ax.set_xticklabels([labels[i] for i in idx_b], rotation=45, ha="right", fontsize=8)
+    ax.set_yticklabels([labels[i] for i in idx_a], fontsize=8)
+    ax.set_xlabel(f"{vid_b} segments")
+    ax.set_ylabel(f"{vid_a} segments")
+    ax.set_title(f"Segment cosine similarity: {vid_a} vs {vid_b}")
+
+    if annotate:
+        threshold = float(sim_matrix.mean())
+        for i in range(n_rows):
+            for j in range(n_cols):
+                color = "white" if sim_matrix[i, j] < threshold else "black"
+                ax.text(j, i, f"{sim_matrix[i, j]:.2f}", ha="center", va="center", fontsize=7, color=color)
+
+    plt.colorbar(im, ax=ax, label="cosine similarity")
+    plt.tight_layout()
+    if show:
+        plt.show()
+
+    n = min(n_rows, n_cols)
+    diag_mean = float(np.mean(np.diag(sim_matrix[:n, :n]))) if n > 0 else float("nan")
+    off_diag_mask = ~np.eye(n, dtype=bool) if n > 1 else np.array([], dtype=bool)
+    off_diag_mean = (
+        float(np.mean(sim_matrix[:n, :n][off_diag_mask]))
+        if n > 1
+        else float("nan")
+    )
+    print(f"Video A: {vid_a} | segments: {n_rows}")
+    print(f"Video B: {vid_b} | segments: {n_cols}")
+    print(f"Mean (cross):       {float(sim_matrix.mean()):.4f}")
+    print(f"Diagonal mean:       {diag_mean:.4f}")
+    print(f"Off-diagonal mean:   {off_diag_mean:.4f}")
 
     return None if show else fig
 
@@ -1668,8 +2012,17 @@ def save_embeddings_npz(
     return output
 
 
-def load_embeddings_npz(npz_path: str | Path) -> dict[str, np.ndarray | list[str] | None]:
-    """Load embedding arrays from .npz with tolerant key aliases."""
+def load_embeddings_npz(
+    npz_path: str | Path,
+    *,
+    require_video_embeddings: bool | None = None,
+) -> dict[str, np.ndarray | list[str] | None]:
+    """Load embedding arrays from .npz with tolerant key aliases.
+
+    If not specified, this is auto-detected from the file contents.
+    For compatibility with earlier behavior, explicitly passing ``True`` enforces
+    that video embeddings are present.
+    """
     path = Path(npz_path).expanduser().resolve()
     with np.load(path, allow_pickle=True) as data:
         keys = set(data.files)
@@ -1682,15 +2035,29 @@ def load_embeddings_npz(npz_path: str | Path) -> dict[str, np.ndarray | list[str
                 raise KeyError(f"Missing required key. Tried {candidates}, found {sorted(keys)}")
             return None
 
-        video_embeddings = _pick(["video_embeddings", "video_embeds", "video_emb"], required=True)
-        video_labels = _pick(["video_labels", "labels", "video_ids"], required=True)
+        if require_video_embeddings is None:
+            require_video_embeddings = any(
+                key in keys for key in ("video_embeddings", "video_embeds", "video_emb")
+            )
+
+        video_embeddings = _pick(
+            ["video_embeddings", "video_embeds", "video_emb"],
+            required=require_video_embeddings,
+        )
+        video_labels = _pick(
+            ["video_labels", "labels", "video_ids"],
+            required=require_video_embeddings,
+        )
         text_embeddings = _pick(["text_embeddings", "text_embeds", "text_emb"], required=False)
         text_labels = _pick(["text_labels", "caption_labels"], required=False)
 
-    video_np = _to_numpy_2d(video_embeddings, name="video_embeddings")
-    video_labels_list = [str(x) for x in np.asarray(video_labels).tolist()]
-    if len(video_labels_list) != video_np.shape[0]:
-        raise ValueError("video_labels length does not match video_embeddings rows")
+    video_np: np.ndarray | None = None
+    video_labels_list: list[str] | None = None
+    if video_embeddings is not None:
+        video_np = _to_numpy_2d(video_embeddings, name="video_embeddings")
+        video_labels_list = [str(x) for x in np.asarray(video_labels).tolist()]  # type: ignore[arg-type]
+        if len(video_labels_list) != video_np.shape[0]:
+            raise ValueError("video_labels length does not match video_embeddings rows")
 
     text_np: np.ndarray | None = None
     text_labels_list: list[str] | None = None
@@ -1704,7 +2071,7 @@ def load_embeddings_npz(npz_path: str | Path) -> dict[str, np.ndarray | list[str
                 raise ValueError("text_labels length does not match text_embeddings rows")
 
     return {
-        "video_embeddings": video_np.astype(np.float32, copy=False),
+        "video_embeddings": None if video_np is None else video_np.astype(np.float32, copy=False),
         "video_labels": video_labels_list,
         "text_embeddings": None if text_np is None else text_np.astype(np.float32, copy=False),
         "text_labels": text_labels_list,
